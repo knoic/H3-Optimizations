@@ -115,11 +115,11 @@ class AIMDOLimiterTests(unittest.TestCase):
         self.assertEqual(schema.node_id, 'H3AIMDOResidencyLimiter')
         self.assertEqual(schema.display_name, 'H3 AIMDO Residency Limiter')
         self.assertEqual(schema.category, 'H3-Optimizations/Model Patches')
-        self.assertEqual([item.id for item in schema.inputs], ['model', 'residency'])
+        self.assertEqual([item.id for item in schema.inputs], ['model', 'residency', 'residency_mib'])
         residency = schema.inputs[1]
         self.assertEqual(
             residency.options,
-            ['0 blocks', '1 block', '2 blocks', '4 blocks', 'stock'],
+            ['0 blocks', '1 block', '2 blocks', '4 blocks', 'stock', 'custom'],
         )
         self.assertEqual(residency.default, '0 blocks')
         self.assertEqual(residency.options[0], residency.default)
@@ -255,6 +255,55 @@ class AIMDOLimiterTests(unittest.TestCase):
         ):
             aimdo_limiter._apply_residency_cap(patcher, 2)
         self.assertEqual(vbar.set_calls, [])
+
+    def test_custom_budget_rounds_down_and_evicts_above_cap(self):
+        for mib, pages in ((0, 0), (31, 0), (32, 1), (95, 2), (256, 8), (1024, 8)):
+            with self.subTest(mib=mib):
+                vbar = FakeVBAR(pages=8)
+                patcher = FakePatcher(vbar=vbar)
+                with (
+                    patch.object(aimdo_limiter.comfy.model_management, 'NUM_STREAMS', 2),
+                    patch.object(aimdo_limiter, 'get_h3_blocks', side_effect=AssertionError('custom must not inspect H3 blocks')),
+                ):
+                    aimdo_limiter._apply_residency_cap(patcher, 0, mib)
+                self.assertEqual(vbar.get_watermark(), pages)
+                self.assertFalse(any(value & 1 for value in vbar.residency[pages:]))
+
+    def test_custom_node_callback_uses_mib_on_non_h3_model(self):
+        vbar = FakeVBAR(pages=16)
+        patcher = FakePatcher(vbar=vbar)
+        with patch.object(aimdo_limiter, 'is_minimax_h3', return_value=False):
+            output = aimdo_limiter.H3AIMDOResidencyLimiter.execute(patcher, 'custom', 95)
+        patched = output.args[0]
+        self.assertIsNot(patched, patcher)
+        callback = patched.callbacks[CallbacksMP.ON_LOAD][aimdo_limiter.CALLBACK_KEY][0]
+        with patch.object(aimdo_limiter.comfy.model_management, 'NUM_STREAMS', 2):
+            callback(patched, None)
+            vbar.watermark = vbar.pages
+            vbar.residency = [1] * vbar.pages
+            callback(patched, None)
+        self.assertEqual(vbar.set_calls, [2 * aimdo_limiter.PAGE_SIZE] * 2)
+        self.assertEqual(patcher.callbacks, {})
+
+    def test_custom_negative_budget_is_rejected_before_installing(self):
+        patcher = FakePatcher(vbar=FakeVBAR())
+        with self.assertRaisesRegex(ValueError, 'residency_mib must be non-negative'):
+            aimdo_limiter.H3AIMDOResidencyLimiter.execute(patcher, 'custom', -1)
+        self.assertEqual(patcher.callbacks, {})
+
+    def test_block_preset_ignores_custom_widget(self):
+        vbar = FakeVBAR(pages=8)
+        patcher = FakePatcher()
+        with patch.object(aimdo_limiter, 'is_minimax_h3', return_value=True):
+            output = aimdo_limiter.H3AIMDOResidencyLimiter.execute(patcher, '1 block', 0)
+        patched = output.args[0]
+        callback = patched.callbacks[CallbacksMP.ON_LOAD][aimdo_limiter.CALLBACK_KEY][0]
+        with (
+            patch.object(aimdo_limiter.comfy.model_management, 'NUM_STREAMS', 2),
+            patch.object(aimdo_limiter, 'get_h3_blocks', return_value=blocks_for(vbar)),
+        ):
+            callback(patched, None)
+        self.assertEqual(vbar.get_watermark(), 3)
 
     def test_non_dynamic_callback_is_an_exact_no_op(self):
         patcher = FakePatcher(dynamic=False)

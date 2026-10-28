@@ -1,4 +1,4 @@
-'''AIMDO VBAR residency cap, with H3 block-equivalent presets.'''
+'''AIMDO VBAR residency cap, with MiB budgets and H3 block presets.'''
 
 import logging
 
@@ -11,7 +11,7 @@ from .model import get_h3_blocks, is_minimax_h3
 
 PAGE_SIZE = 32 * 1024 * 1024
 CALLBACK_KEY = 'h3_optimizations_aimdo_residency_limiter'
-RESIDENCY_OPTIONS = ('0 blocks', '1 block', '2 blocks', '4 blocks', 'stock')
+RESIDENCY_OPTIONS = ('0 blocks', '1 block', '2 blocks', '4 blocks', 'stock', 'custom')
 DEFAULT_RESIDENCY = '0 blocks'
 RESIDENCY_BLOCKS = {
     '0 blocks': 0,
@@ -76,7 +76,7 @@ def _residency_cap_pages(block_page_counts, block_equivalents):
     return sum(sorted(block_page_counts, reverse=True)[:block_equivalents])
 
 
-def _zero_residency_vbar(patcher):
+def _residency_vbar(patcher):
     get_vbar = getattr(patcher, '_vbar_get', None)
     if callable(get_vbar):
         return get_vbar()
@@ -90,7 +90,7 @@ def _zero_residency_vbar(patcher):
     return vbar
 
 
-def _apply_residency_cap(patcher, block_equivalents):
+def _apply_residency_cap(patcher, block_equivalents, residency_mib=None):
     if not patcher.is_dynamic():
         return
     if comfy.model_management.NUM_STREAMS <= 0:
@@ -102,11 +102,14 @@ def _apply_residency_cap(patcher, block_equivalents):
     if block_equivalents < 0:
         raise ValueError('block_equivalents must be non-negative')
 
-    if block_equivalents == 0:
-        vbar = _zero_residency_vbar(patcher)
+    if residency_mib is not None or block_equivalents == 0:
+        vbar = _residency_vbar(patcher)
         if vbar is None:
             return
-        cap_pages = 0
+        if residency_mib is not None and residency_mib < 0:
+            raise ValueError('residency_mib must be non-negative')
+        # Round down so a custom budget is never exceeded by page alignment.
+        cap_pages = 0 if residency_mib is None else int(residency_mib) * (1024 * 1024) // PAGE_SIZE
     else:
         blocks = get_h3_blocks(patcher)
         if not blocks:
@@ -143,19 +146,18 @@ def _apply_residency_cap(patcher, block_equivalents):
         )
 
     logging.debug(
-        '%s AIMDO residency limited to %d block-equivalent(s), %d pages, %d MiB',
+        '%s AIMDO residency limited to %d pages, %d MiB',
         LOG_PREFIX,
-        block_equivalents,
         expected_pages,
         expected_pages * PAGE_SIZE // (1024 * 1024),
     )
 
 
-def install_aimdo_limiter(model_patcher, block_equivalents):
+def install_aimdo_limiter(model_patcher, block_equivalents, residency_mib=None):
     model_patcher.remove_callbacks_with_key(CallbacksMP.ON_LOAD, CALLBACK_KEY)
 
     def apply_after_load(patcher, _device, *_args):
-        _apply_residency_cap(patcher, block_equivalents)
+        _apply_residency_cap(patcher, block_equivalents, residency_mib)
 
     model_patcher.add_callback_with_key(
         CallbacksMP.ON_LOAD,
@@ -175,7 +177,7 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
             category='H3-Optimizations/Model Patches',
             description=(
                 'Controls how much model weight DynamicVRAM keeps resident in VRAM. '
-                'The default 0 blocks setting works for any DynamicVRAM model; '
+                'The default 0 blocks and custom MiB settings work for any DynamicVRAM model; '
                 '1/2/4 block-equivalent settings remain H3-specific. It is mainly '
                 'useful for benchmarking, debugging AIMDO, or forcing minimal '
                 'persistent model residency on tight VRAM budgets. It does not cap '
@@ -199,8 +201,24 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
                         'pages persistently resident. 1/2/4 blocks use H3 '
                         'block-equivalent budgets and may trade VRAM for less weight '
                         'streaming. stock leaves ComfyUI AIMDO residency management '
-                        'unchanged. Numeric choices require DynamicVRAM and async '
+                        'unchanged. custom uses the residency_mib budget. '
+                        'Numeric choices require DynamicVRAM and async '
                         'weight offloading.'
+                    ),
+                ),
+                io.Int.Input(
+                    'residency_mib',
+                    display_name='Custom resident weights (MiB)',
+                    default=256,
+                    min=0,
+                    max=1048576,
+                    step=32,
+                    optional=True,
+                    tooltip=(
+                        'Used only with custom. Caps persistent VBAR weights, rounded '
+                        'down to 32 MiB pages. Lower values leave more room for '
+                        'activations but increase weight streaming. 0 keeps no '
+                        'persistent pages. This is not a total VRAM or peak limit.'
                     ),
                 ),
             ],
@@ -208,10 +226,10 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, residency=DEFAULT_RESIDENCY):
+    def execute(cls, model, residency=DEFAULT_RESIDENCY, residency_mib=256):
         if residency not in RESIDENCY_OPTIONS:
             raise ValueError('unknown AIMDO residency budget %r' % residency)
-        if residency != '0 blocks' and not is_minimax_h3(model):
+        if residency not in ('0 blocks', 'custom') and not is_minimax_h3(model):
             return io.NodeOutput(model)
 
         patched = model.clone()
@@ -230,14 +248,22 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
                 ),
             )
 
-        block_equivalents = RESIDENCY_BLOCKS[residency]
-        install_aimdo_limiter(patched, block_equivalents)
-        preview = (
-            'AIMDO residency limiter armed for zero persistent VBAR pages'
-            if block_equivalents == 0
-            else 'AIMDO residency limiter armed for %d block-equivalent(s)'
-            % block_equivalents
-        )
+        if residency == 'custom':
+            if residency_mib < 0:
+                raise ValueError('residency_mib must be non-negative')
+            install_aimdo_limiter(patched, 0, residency_mib)
+            preview = 'AIMDO residency limiter armed for %d MiB of persistent VBAR weights' % (
+                int(residency_mib) // 32 * 32
+            )
+        else:
+            block_equivalents = RESIDENCY_BLOCKS[residency]
+            install_aimdo_limiter(patched, block_equivalents)
+            preview = (
+                'AIMDO residency limiter armed for zero persistent VBAR pages'
+                if block_equivalents == 0
+                else 'AIMDO residency limiter armed for %d block-equivalent(s)'
+                % block_equivalents
+            )
         return io.NodeOutput(
             patched,
             ui=ui.PreviewText(preview),
