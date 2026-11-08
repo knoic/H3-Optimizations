@@ -156,9 +156,16 @@ def _override_wraps_backend(override, backend):
     ):
         return True
 
-    # Current ModelPatcher.set_model_optimized_attention closes over the exact
-    # registered backend callable. Keep this fallback so detection still works
-    # if Kitchen ever stops exposing a container function.
+    # Only Comfy's direct-delegation wrapper may be identified by its closure.
+    # Sparse overrides such as SLA also capture a registered dense backend,
+    # but use it only on dense steps. Treating that reference as delegation
+    # would bypass their sparse execution with our private dense carrier.
+    if (
+        getattr(override, '__module__', '') != 'comfy.model_patcher'
+        or getattr(override, '__qualname__', '')
+        != 'ModelPatcher.set_model_optimized_attention.<locals>.optimized_attention_override'
+    ):
+        return False
     for cell in getattr(override, '__closure__', None) or ():
         try:
             wrapped = cell.cell_contents

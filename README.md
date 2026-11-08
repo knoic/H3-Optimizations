@@ -205,6 +205,15 @@ BF16 Triton, FROST, FP8, and Sparse Sage are not.
 AMD sparse support has additional hardware-specific limits. See
 [AMD Sparse Kitchen](#amd-sparse-kitchen).
 
+### External sparse attention (H3 SLA Attention)
+
+Memory Optimization preserves SLA's attention override, including its sparse
+routing and scheduled dense steps. A dense backend selected inside SLA is only
+its fallback; it does not authorize replacing SLA with dense attention.
+SLA keeps its full-sequence QKV call, so Memory Optimization's private QKV
+streaming is disabled on this path. Compatible MLP, FinalLayer, and embedding
+memory optimizations remain available.
+
 ### LoRAs
 
 Use ComfyUI's standard **Load LoRA** node. Its weight patches apply normally

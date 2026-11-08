@@ -41,7 +41,10 @@ from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_PRESERVE_BF16,
     H3OptimizationPlan,
     MemoryRequest,
+    QKV_STREAMING_AUTO,
+    QKV_STREAMING_FORCED,
     QKV_STREAMING_OFF,
+    SparseRequest,
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
     QKV_BF16_CHUNKED,
@@ -87,6 +90,39 @@ def sage_attention(*_args, **_kwargs):
 
 
 class DenseSelectionTests(unittest.TestCase):
+    def test_sla_dense_fallback_cannot_select_private_dense_qkv(self):
+        def make_sla(dense_fn):
+            def override(func, *args, **kwargs):
+                return dense_fn(*args, **kwargs)
+            return override
+
+        override = make_sla(kitchen_attention)
+        model = FakePatcher()
+        model.model_options['transformer_options']['optimized_attention_override'] = override
+        for streaming in (QKV_STREAMING_OFF, QKV_STREAMING_AUTO, QKV_STREAMING_FORCED):
+            for sparse in (None, SparseRequest()):
+                with self.subTest(streaming=streaming, sparse=sparse):
+                    plan = H3OptimizationPlan(
+                        memory=MemoryRequest(qkv_streaming=streaming), sparse=sparse,
+                    )
+                    with patch(
+                        'h3_optimizations.dense_resolver.get_attention_function',
+                        side_effect=lambda name, _default: (
+                            kitchen_attention if name == 'comfy_kitchen_int8' else None
+                        ),
+                    ):
+                        attention, qkv = apply_module._resolve_attention(
+                            plan, model, self._convrot_inventory(),
+                            SimpleNamespace(capability=(8, 9)),
+                        )
+                    self.assertIsNone(attention.backend)
+                    self.assertIsNone(attention.projector)
+                    self.assertEqual(qkv.provider_id, QKV_STANDARD)
+                    self.assertIs(
+                        model.model_options['transformer_options']['optimized_attention_override'],
+                        override,
+                    )
+
     @staticmethod
     def _convrot_inventory():
         return SimpleNamespace(

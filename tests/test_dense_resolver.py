@@ -22,6 +22,7 @@ import comfy.options  # noqa: E402
 
 comfy.options.enable_args_parsing()
 
+from comfy.model_patcher import ModelPatcher  # noqa: E402
 import h3_optimizations.dense_resolver as dense_resolver  # noqa: E402
 import h3_optimizations.kitchen_qkv as kitchen_qkv  # noqa: E402
 
@@ -110,6 +111,41 @@ class FakeKitchen:
 
 
 class DenseResolverTests(unittest.TestCase):
+    def test_sparse_override_with_dense_fallback_is_not_a_dense_wrapper(self):
+        # SLA captures its pinned dense backend in a closure, but executes
+        # sparse attention on eligible steps. Capturing it is not delegation.
+        def make_sparse(dense_fn):
+            def override(func, q, *args, **kwargs):
+                if kwargs.pop('dense_step', False):
+                    return dense_fn(q, *args, **kwargs)
+                return q + 1
+            return override
+
+        for name in ('comfy_kitchen_int8', 'sage', 'pytorch'):
+            with self.subTest(backend=name):
+                backend = lambda *_a, **_k: None
+                override = make_sparse(backend)
+                patcher = FakePatcher(override)
+                options = patcher.model_options['transformer_options']
+                with mock.patch.object(
+                    dense_resolver, 'get_attention_function',
+                    side_effect=lambda key, _default: backend if key == name else None,
+                ):
+                    self.assertFalse(dense_resolver.is_replaceable_dense_attention(options))
+                    resolution = dense_resolver.resolve_current_dense_attention(
+                        patcher, SimpleNamespace(capability=(8, 9)),
+                    )
+                self.assertEqual(resolution.backend_kind, dense_resolver.ATTENTION_EXISTING_FULL_Q)
+                self.assertIsNone(resolution.backend)
+                self.assertIs(options['optimized_attention_override'], override)
+
+    def test_modelpatcher_wrapper_without_container_is_still_recognized(self):
+        backend = lambda *_a, **_k: None
+        patcher = FakePatcher()
+        ModelPatcher.set_model_optimized_attention(patcher, backend)
+        override = patcher.model_options['transformer_options']['optimized_attention_override']
+        self.assertTrue(dense_resolver._override_wraps_backend(override, backend))
+
     def test_opted_in_external_consumer_gets_streamed_q(self):
         def override(*_args, **_kwargs):
             return None
