@@ -12,6 +12,7 @@ import comfy.model_prefetch
 from comfy.ldm.minimax import model as minimax
 
 from ..model import get_minimax_h3_model, unpatched_model_object
+from .async_prefetch import AsyncBlockDoubleBuffer
 
 
 FORWARD_KEY = 'diffusion_model._forward'
@@ -225,8 +226,13 @@ def make_forward(model, original_forward, generation):
         patches_replace = transformer_options.get('patches_replace', {})
         blocks_replace = patches_replace.get('dit', {})
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(model.blocks), device, transformer_options)
-        for i, block in enumerate(model.blocks):
-            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block, **prefetch_scope)
+        double_buffer = AsyncBlockDoubleBuffer(
+            blocks=list(model.blocks),
+            device=device,
+            prefetch_queue=prefetch_queue,
+            prefetch_scope=prefetch_scope,
+        )
+        for i, block in double_buffer.iterate():
             if current:
                 transformer_options['block_index'] = i
             if ('double_block', i) in blocks_replace:
@@ -241,8 +247,6 @@ def make_forward(model, original_forward, generation):
                 h = blocks_replace[('double_block', i)](block_args, {'original_block': block_wrap})['img']
             else:
                 h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
-        if current or prefetch_queue is not None:
-            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None, **prefetch_scope)
 
         va, vb, _ = next(s for s in layout.segments if s[2] == 'video')
         aa, ab, _ = next(s for s in layout.segments if s[2] == 'audio')
@@ -331,6 +335,11 @@ def install(model_patcher, *, force_rebuild=False, strict=False):
         options['h3_optimizations_preserved_embedding_patch'] = False
         return False
     model_patcher.add_object_patch(FORWARD_KEY, make_forward(model, original, generation))
+    try:
+        from ..aimdo_limiter import ensure_double_buffer_residency
+        ensure_double_buffer_residency(model_patcher)
+    except Exception as exc:
+        logging.debug('[H3 Optimizations] ensure_double_buffer_residency skipped: %s', exc)
     options = model_patcher.model_options['transformer_options'] = (
         model_patcher.model_options.get('transformer_options', {}).copy()
     )
