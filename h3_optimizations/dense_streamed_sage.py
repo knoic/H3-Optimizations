@@ -15,7 +15,7 @@ from .attention.sage_v_staging import (
     BACKEND_TRITON as SAGE_STAGING_TRITON,
     TwoPassSageVCarrier,
 )
-from .normalized_rows import attention_output_buffer
+from .normalized_rows import NormalizedRows, attention_output_buffer
 from .plan import V_MEMORY_RETAIN, V_MEMORY_TWO_PASS
 from .qkv.streamed import (
     create_held_qkv,
@@ -135,7 +135,7 @@ class StreamedDenseSageQKVProjector:
         declines by returning None, so the request degrades to Standard
         instead of costing a reprojection for nothing.
         """
-        if self.v_mode != V_MEMORY_TWO_PASS:
+        if self._staging_parameters is None:
             return None
         scale_max, pad_to = self._staging_parameters
         return TwoPassSageVCarrier(
@@ -177,6 +177,7 @@ class StreamedDenseSageQKVProjector:
         staging = self._staging(sequence, heads, x)
         staged_v_carrier = None
         staged_v_scale = None
+        stashed_v = [] if staging is not None else None
         v = (
             None
             if staging is not None
@@ -207,15 +208,24 @@ class StreamedDenseSageQKVProjector:
                 else:
                     with diagnostics.stage("v_amax_update"):
                         staging.update(chunk_v)
+                    use_fp8 = chunk_v.is_cuda and hasattr(torch, "float8_e4m3fn")
+                    stashed_v.append(
+                        chunk_v.to(torch.float8_e4m3fn)
+                        if use_fp8
+                        else chunk_v.clone()
+                    )
                 del k, chunk_v, chunk_k, chunk_scale
             if staging is not None:
-                # Second pass: V only. K is already packed, so this reprojects
-                # strictly the rows the carrier still needs.
                 staging.finalize_scale()
                 for start in range(0, sequence, self.chunk_rows):
                     stop = min(start + self.chunk_rows, sequence)
-                    with diagnostics.stage("v_reprojection"):
-                        chunk_v = project_v_hnd(held, x, rope_freqs, start, stop)
+                    if stashed_v:
+                        chunk_v = stashed_v.pop(0)
+                        if chunk_v.dtype != x.dtype:
+                            chunk_v = chunk_v.to(x.dtype)
+                    else:
+                        with diagnostics.stage("v_reprojection"):
+                            chunk_v = project_v_hnd(held, x, rope_freqs, start, stop)
                     with diagnostics.stage("v_carrier_pack"):
                         staging.quantize(chunk_v, start)
                     del chunk_v
@@ -315,8 +325,18 @@ class StreamedDenseSageBackend:
                 "streamed dense Sage module changed between prepare and execute"
             )
 
-        result = attention_output_buffer(projected.x)
-        hidden = int(result.shape[1])
+        residual_source = projected.x
+        can_in_place_residual = (
+            isinstance(residual_source, NormalizedRows)
+            and residual_source.attention_residual_pending
+        )
+        result = None if can_in_place_residual else attention_output_buffer(residual_source)
+        hidden = int(residual_source.shape[1])
+        residual_projection = (
+            getattr(module, "_h3_out_proj_residual", lambda *args: False)
+            if can_in_place_residual
+            else None
+        )
         try:
             for start in range(0, projected.sequence, projected.query_chunk_rows):
                 stop = min(start + projected.query_chunk_rows, projected.sequence)
@@ -362,14 +382,26 @@ class StreamedDenseSageBackend:
                 )
                 del raw
                 with diagnostics.stage("attention_out"):
-                    projected_rows = module.out_proj(flat)
-                    if tuple(projected_rows.shape) != (rows, hidden):
-                        raise EfficientSageError(
-                            "streamed dense Sage out_proj returned %s"
-                            % (tuple(projected_rows.shape),)
+                    if can_in_place_residual:
+                        residual_source.write_attention_residual(
+                            flat,
+                            start,
+                            stop,
+                            module.out_proj,
+                            residual_projection,
                         )
-                    result[start:stop].copy_(projected_rows)
-                del flat, projected_rows
+                    else:
+                        projected_rows = module.out_proj(flat)
+                        if tuple(projected_rows.shape) != (rows, hidden):
+                            raise EfficientSageError(
+                                "streamed dense Sage out_proj returned %s"
+                                % (tuple(projected_rows.shape),)
+                            )
+                        result[start:stop].copy_(projected_rows)
+                        del projected_rows
+                del flat
+            if can_in_place_residual:
+                return residual_source.finish_attention_residual()
             return result
         finally:
             prepared.release()

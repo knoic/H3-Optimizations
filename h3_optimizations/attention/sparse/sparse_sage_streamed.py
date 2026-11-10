@@ -26,7 +26,7 @@ import math
 import torch
 
 from ... import diagnostics
-from ...normalized_rows import attention_output_buffer
+from ...normalized_rows import NormalizedRows, attention_output_buffer
 from ...qkv.formats import describe_linear
 from ...plan import V_MEMORY_RETAIN, V_MEMORY_TWO_PASS
 from ...qkv.streamed import (
@@ -911,30 +911,36 @@ def execute_streamed_sparse_sage(module, backend, prepared):
     q_tile = int(spec.q_tile)
     max_rows = min(int(projected.query_chunk_rows), sequence)
     max_q_tiles = (max_rows + q_tile - 1) // q_tile
-    result = attention_output_buffer(projected.x)
+    residual_source = projected.x
+    can_in_place_residual = (
+        isinstance(residual_source, NormalizedRows)
+        and residual_source.attention_residual_pending
+    )
+    result = None if can_in_place_residual else attention_output_buffer(residual_source)
+    device = residual_source.device
 
     q_int8_buffer = torch.empty(
         (1, heads, max_rows, HEAD_DIM),
         dtype=torch.int8,
-        device=result.device,
+        device=device,
     )
     q_scale_buffer = torch.empty(
         (1, heads, max_q_tiles),
         dtype=torch.float32,
-        device=result.device,
+        device=device,
     )
     q_summary_buffer = torch.empty(
         (1, heads, max_q_tiles, HEAD_DIM),
         dtype=projected.output_dtype,
-        device=result.device,
+        device=device,
     )
     output_buffer = torch.empty(
         (1, heads, max_rows, HEAD_DIM),
         dtype=projected.output_dtype,
-        device=result.device,
+        device=device,
     )
     pv_threshold = torch.full(
-        (heads,), 50.0, dtype=torch.float32, device=result.device
+        (heads,), 50.0, dtype=torch.float32, device=device
     )
 
     try:
@@ -1036,16 +1042,26 @@ def execute_streamed_sparse_sage(module, backend, prepared):
                         .transpose(1, 2)
                         .reshape(proj_rows, heads * HEAD_DIM)
                     )
-                    projected_rows = module.out_proj(attention_rows)
-                    if tuple(projected_rows.shape) != (proj_rows, hidden):
-                        raise SparseSageError(
-                            "streamed Sparse Sage out_proj shape %s is invalid"
-                            % (tuple(projected_rows.shape),)
+                    if can_in_place_residual:
+                        residual_source.write_attention_residual(
+                            attention_rows,
+                            row_start + local_start,
+                            row_start + local_end,
+                            module.out_proj,
+                            getattr(module, "_h3_out_proj_residual", lambda *args: False),
                         )
-                    result[
-                        row_start + local_start:row_start + local_end
-                    ].copy_(projected_rows)
-                    del attention_rows, projected_rows
+                    else:
+                        projected_rows = module.out_proj(attention_rows)
+                        if tuple(projected_rows.shape) != (proj_rows, hidden):
+                            raise SparseSageError(
+                                "streamed Sparse Sage out_proj shape %s is invalid"
+                                % (tuple(projected_rows.shape),)
+                            )
+                        result[
+                            row_start + local_start:row_start + local_end
+                        ].copy_(projected_rows)
+                        del projected_rows
+                    del attention_rows
 
             if not full_chunk:
                 del q_int8, q_scale, q_summary_scratch, output
@@ -1059,4 +1075,6 @@ def execute_streamed_sparse_sage(module, backend, prepared):
             pv_threshold,
         )
 
+    if can_in_place_residual:
+        return residual_source.finish_attention_residual()
     return result

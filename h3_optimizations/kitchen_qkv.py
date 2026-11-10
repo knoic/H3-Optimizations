@@ -278,6 +278,7 @@ def run_chunked_kitchen_qkv(
             raise FusedQKVError('unknown Kitchen V mode %r' % v_mode)
         staging = None
         single_pass = None
+        stashed_v = None
         if v_mode == V_MODE_BLOCK:
             from .native.block_v import SinglePassVCarrier, available
 
@@ -286,11 +287,19 @@ def run_chunked_kitchen_qkv(
             if int(spec.kernel_head_dim) != 128 or not available():
                 raise FusedQKVError('Single-pass V requires head_dim 128 and the H3 block-V library')
             single_pass = SinglePassVCarrier(spec, block_rows=int(chunk_rows))
-        if v_mode == V_MODE_TWO_PASS:
-            from .native.v_staging import TwoPassVCarrier
+        else:
+            from .native.v_staging import TwoPassVCarrier, BACKEND_NATIVE, BACKEND_TORCH
 
-            staging = TwoPassVCarrier(spec)
-        retained_v = None
+            staging_backend = (
+                BACKEND_NATIVE
+                if getattr(spec.device, 'type', '') == 'cuda'
+                else BACKEND_TORCH
+            )
+            staging = TwoPassVCarrier(spec, backend=staging_backend)
+            # In V_MODE_RETAIN (Standard mode), stash projected V chunks in memory to
+            # eliminate the monolithic uncompressed BF16 retained_v tensor while avoiding
+            # the second GEMM reprojection pass.
+            stashed_v = [] if v_mode == V_MODE_RETAIN else None
         q_summaries = []
         k_summaries = []
         for start in range(0, sequence, int(chunk_rows)):
@@ -303,10 +312,6 @@ def run_chunked_kitchen_qkv(
                 end,
                 projector=held,
             )
-            if staging is None and single_pass is None and retained_v is None:
-                retained_v = v.new_empty(
-                    (1, int(module.heads), sequence, int(module.head_dim))
-                )
             if routing_summaries:
                 with diagnostics.stage('routing_summary_generation'):
                     q_summaries.append(_tile_mean(q, routing_q_tile))
@@ -321,29 +326,31 @@ def run_chunked_kitchen_qkv(
             )
             if single_pass is not None:
                 single_pass.quantize(v, start)
-            elif staging is None:
-                with diagnostics.stage('v_retention_copy'):
-                    retained_v[:, :, start:end, :].copy_(v)
             else:
                 with diagnostics.stage('v_amax_update'):
                     staging.update(v)
+                if stashed_v is not None:
+                    use_fp8 = v.is_cuda and hasattr(torch, 'float8_e4m3fn')
+                    stashed_v.append(v.to(torch.float8_e4m3fn) if use_fp8 else v.clone())
             del q, k, v
 
         if single_pass is not None:
             producer.v, producer.v_scale = single_pass.finish()
             producer.v_scale_rows = single_pass.block_rows
-        elif staging is None:
-            kitchen.quantize_int8_attention_v(producer, retained_v)
-            del retained_v
         else:
             staging.finalize_scale()
             for start in range(0, sequence, int(chunk_rows)):
                 end = min(start + int(chunk_rows), sequence)
-                with diagnostics.stage('v_reprojection'):
-                    v = project_v_hnd(held, x, rope_freqs, start, end)
+                if stashed_v:
+                    chunk_v = stashed_v.pop(0)
+                    if chunk_v.dtype != x.dtype:
+                        chunk_v = chunk_v.to(x.dtype)
+                else:
+                    with diagnostics.stage('v_reprojection'):
+                        chunk_v = project_v_hnd(held, x, rope_freqs, start, end)
                 with diagnostics.stage('v_carrier_pack'):
-                    staging.quantize(v, start)
-                del v
+                    staging.quantize(chunk_v, start)
+                del chunk_v
             producer.v, producer.v_scale = staging.finish()
         with diagnostics.stage('carrier_finalize'):
             return PreparedChunkedKitchenQKV(
@@ -396,19 +403,22 @@ def run_streamed_kitchen_qkv(
         if v_mode not in V_MODES:
             raise FusedQKVError('unknown Kitchen V mode %r' % v_mode)
         staging = None
-        if v_mode == V_MODE_TWO_PASS:
-            from .native.v_staging import TwoPassVCarrier
+        stashed_v = None
+        if v_mode in (V_MODE_TWO_PASS, V_MODE_RETAIN):
+            from .native.v_staging import TwoPassVCarrier, BACKEND_NATIVE, BACKEND_TORCH
 
-            staging = TwoPassVCarrier(spec)
+            staging_backend = (
+                BACKEND_NATIVE
+                if getattr(spec.device, 'type', '') == 'cuda'
+                else BACKEND_TORCH
+            )
+            staging = TwoPassVCarrier(spec, backend=staging_backend)
+            stashed_v = [] if v_mode == V_MODE_RETAIN else None
         retained_v = None
         chunk_kwargs = _qk_chunk_kwargs(kitchen, strided_qk_input)
         for start in range(0, sequence, int(chunk_rows)):
             end = min(start + int(chunk_rows), sequence)
             k, v = project_kv_hnd(held, x, rope_freqs, start, end)
-            if staging is None and retained_v is None:
-                retained_v = v.new_empty(
-                    (1, int(module.heads), sequence, int(module.head_dim))
-                )
             kitchen.quantize_int8_attention_k_chunk(
                 producer,
                 k,
@@ -416,11 +426,18 @@ def run_streamed_kitchen_qkv(
                 **chunk_kwargs,
             )
             if staging is None:
+                if retained_v is None:
+                    retained_v = v.new_empty(
+                        (1, int(module.heads), sequence, int(module.head_dim))
+                    )
                 with diagnostics.stage('v_retention_copy'):
                     retained_v[..., start:end, :].copy_(v)
             else:
                 with diagnostics.stage('v_amax_update'):
                     staging.update(v)
+                if stashed_v is not None:
+                    use_fp8 = v.is_cuda and hasattr(torch, 'float8_e4m3fn')
+                    stashed_v.append(v.to(torch.float8_e4m3fn) if use_fp8 else v.clone())
             del k, v
         if staging is None:
             kitchen.quantize_int8_attention_v(producer, retained_v)
@@ -429,11 +446,16 @@ def run_streamed_kitchen_qkv(
             staging.finalize_scale()
             for start in range(0, sequence, int(chunk_rows)):
                 end = min(start + int(chunk_rows), sequence)
-                with diagnostics.stage('v_reprojection'):
-                    v = project_v_hnd(held, x, rope_freqs, start, end)
+                if stashed_v:
+                    chunk_v = stashed_v.pop(0)
+                    if chunk_v.dtype != x.dtype:
+                        chunk_v = chunk_v.to(x.dtype)
+                else:
+                    with diagnostics.stage('v_reprojection'):
+                        chunk_v = project_v_hnd(held, x, rope_freqs, start, end)
                 with diagnostics.stage('v_carrier_pack'):
-                    staging.quantize(v, start)
-                del v
+                    staging.quantize(chunk_v, start)
+                del chunk_v
             producer.v, producer.v_scale = staging.finish()
         carrier = kitchen.finalize_int8_attention_producer(producer)
     finally:
@@ -737,13 +759,14 @@ class ChunkedKitchenAttentionBackend:
         from .native.int8_attention import OUTPUT_NHD
 
         quantized = prepared.carrier
-        if (
-            isinstance(prepared.output_buffer, NormalizedRows)
-            and prepared.output_buffer.attention_residual_pending
-            and quantized.v_scale.ndim == 4
-        ):
+        residual_source = prepared.output_buffer
+        can_in_place_residual = (
+            isinstance(residual_source, NormalizedRows)
+            and residual_source.attention_residual_pending
+        )
+        if can_in_place_residual and quantized.v_scale.ndim == 4:
             return self._execute_block_v_residual(module, prepared, kitchen)
-        output = attention_output_buffer(prepared.output_buffer)
+        output = None if can_in_place_residual else attention_output_buffer(residual_source)
         streamed_q = isinstance(prepared, PreparedStreamedKitchenQKV)
         sequence = int(prepared.x.shape[0]) if streamed_q else int(quantized.q.shape[-2])
         if not streamed_q:
@@ -757,6 +780,11 @@ class ChunkedKitchenAttentionBackend:
             )
 
         held = None
+        residual_projection = (
+            getattr(module, '_h3_out_proj_residual', lambda *args: False)
+            if can_in_place_residual
+            else None
+        )
         try:
             if streamed_q:
                 binding = create_held_qkv(
@@ -798,8 +826,21 @@ class ChunkedKitchenAttentionBackend:
                     module.heads * module.head_dim,
                 )
                 with diagnostics.stage('attention_out'):
-                    output[start:stop].copy_(module.out_proj(flat.squeeze(0)))
+                    chunk_input = flat.squeeze(0)
+                    if can_in_place_residual:
+                        residual_source.write_attention_residual(
+                            chunk_input,
+                            start,
+                            stop,
+                            module.out_proj,
+                            residual_projection,
+                        )
+                    else:
+                        output[start:stop].copy_(module.out_proj(chunk_input))
+                    del chunk_input
                 del raw, flat, chunk_carrier, q, q_scale
+            if can_in_place_residual:
+                return residual_source.finish_attention_residual()
             return output
         finally:
             if held is not None:
