@@ -18,9 +18,7 @@ RESIDENCY_BLOCKS = {
     '1 block': 1,
     '2 blocks': 2,
     '4 blocks': 4,
-    'double_buffer': 2,
 }
-DOUBLE_BUFFER_RESIDENCY = '2 blocks'
 LOG_PREFIX = '[H3 Optimizations]'
 
 
@@ -168,24 +166,6 @@ def install_aimdo_limiter(model_patcher, block_equivalents, residency_mib=None):
     )
 
 
-def ensure_double_buffer_residency(model_patcher, min_blocks=2):
-    '''Ensure that DynamicVRAM has at least min_blocks resident for async double-buffering.
-
-    When async PCIe weight prefetching is active, keeping at least 2 blocks resident
-    allows the current block compute to overlap with background DMA transfer of the
-    next block without thrashing VBAR pages.
-    '''
-    if not hasattr(model_patcher, 'is_dynamic') or not model_patcher.is_dynamic():
-        return
-    if not is_minimax_h3(model_patcher):
-        return
-    callbacks = getattr(model_patcher, 'callbacks', {}).get(CallbacksMP.ON_LOAD, {}).get(CALLBACK_KEY, [])
-    if callbacks:
-        # Patcher already has an explicit residency limiter callback configured
-        return
-    install_aimdo_limiter(model_patcher, block_equivalents=min_blocks)
-
-
 class H3AIMDOResidencyLimiter(io.ComfyNode):
     '''Limit persistent AIMDO VBAR residency after dynamic model loading.'''
 
@@ -247,8 +227,6 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, residency=DEFAULT_RESIDENCY, residency_mib=256):
-        if residency == 'double_buffer':
-            residency = DOUBLE_BUFFER_RESIDENCY
         if residency not in RESIDENCY_OPTIONS:
             raise ValueError('unknown AIMDO residency budget %r' % residency)
         if residency not in ('0 blocks', 'custom') and not is_minimax_h3(model):
