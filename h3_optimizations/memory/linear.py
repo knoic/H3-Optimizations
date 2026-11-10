@@ -12,6 +12,7 @@ import comfy.quant_ops
 from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 
 from . import fused_residual
+from ..fused_swiglu import fused_swiglu_inplace_
 
 
 _CONVROT_MLPS = weakref.WeakValueDictionary()
@@ -33,10 +34,7 @@ def swiglu_inplace_(x):
     Bit-identical to :func:`swiglu_eager` without allocating a second
     activation-width tensor. ``x`` is consumed: only the returned view is valid.
     """
-    width = int(x.shape[-1]) // 2
-    gate = x[..., :width]
-    torch.nn.functional.silu(gate, inplace=True).mul_(x[..., width:])
-    return gate
+    return fused_swiglu_inplace_(x)
 
 
 def _stream_from_handle(handle):
@@ -198,27 +196,36 @@ class HeldMLP:
         """Fold ``residual += gate * fc2(swiglu(expanded))`` into the fc2 kernel.
 
         Returns False, with ``residual`` untouched, unless fc2 is a TensorWise
-        INT8 weight and Comfy Kitchen's fused residual kernel is usable; the
-        caller then uses :meth:`fc2_swiglu` and ``addcmul_`` as before.
+        INT8 weight or standard floating linear weight; the caller then uses
+        :meth:`fc2_swiglu` and ``addcmul_`` as before.
         """
         weight = self.fc2_weight.weight
         if (
-            not isinstance(weight, QuantizedTensor)
-            or getattr(weight, "_layout_cls", None) != "TensorWiseINT8Layout"
-            or getattr(weight._params, "transposed", False)
+            isinstance(weight, QuantizedTensor)
+            and getattr(weight, "_layout_cls", None) == "TensorWiseINT8Layout"
+            and not getattr(weight._params, "transposed", False)
         ):
-            return False
-        qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
-        return fused_residual.gated_swiglu_residual_(
-            expanded,
-            qdata,
-            scale,
-            self.fc2_weight.bias,
-            residual,
-            gate,
-            convrot=getattr(weight._params, "convrot", False),
-            convrot_groupsize=getattr(weight._params, "convrot_groupsize", 256),
-        )
+            qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+            return fused_residual.gated_swiglu_residual_(
+                expanded,
+                qdata,
+                scale,
+                self.fc2_weight.bias,
+                residual,
+                gate,
+                convrot=getattr(weight._params, "convrot", False),
+                convrot_groupsize=getattr(weight._params, "convrot_groupsize", 256),
+            )
+        if (
+            not isinstance(weight, QuantizedTensor)
+            and getattr(weight, "dtype", None) in (torch.bfloat16, torch.float16, torch.float32)
+            and residual.is_contiguous()
+        ):
+            activated = swiglu_inplace_(expanded)
+            out = self.fc2_weight.linear(activated)
+            residual.addcmul_(out, gate)
+            return True
+        return False
 
 
 def _convrot_parts(weight, name):
