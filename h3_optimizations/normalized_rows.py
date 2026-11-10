@@ -31,6 +31,7 @@ import torch
 
 import comfy.ops
 
+from .fused_adaln_norm import fused_adaln_rms_norm
 from .native import (
     RMS_ADALN_BF16_STAGED,
     quantize_rms_adaln_int8_rowwise_convrot256,
@@ -116,6 +117,19 @@ class NormalizedRows:
             raise NormalizedRowsUnsupported(
                 'NormalizedRows supports row (dim 0) selection only'
             )
+        norm_weight = getattr(self._norm, 'weight', None)
+        if norm_weight is not None and self._shift is not None and self._scale is not None:
+            eps = getattr(self._norm, 'eps', 1e-6)
+            gathered = self._x.index_select(0, index)
+            selectors = self._row_selectors(index)
+            return fused_adaln_rms_norm(
+                gathered,
+                norm_weight,
+                self._scale,
+                self._shift,
+                selector=selectors,
+                eps=eps,
+            )
         rows = self._norm(self._x.index_select(0, index))
         self._apply(rows, self._shift, self._scale, self._row_selectors(index))
         return rows
@@ -125,6 +139,55 @@ class NormalizedRows:
 
     def __getitem__(self, item):
         start, stop = self._bounds(item)
+        if start == stop:
+            return self._x[start:stop]
+
+        norm_weight = getattr(self._norm, 'weight', None)
+        if norm_weight is not None and self._shift is not None and self._scale is not None:
+            eps = getattr(self._norm, 'eps', 1e-6)
+            spans = []
+            for seg_start, seg_stop, selector in self._segments:
+                lo = seg_start if seg_start > start else start
+                hi = seg_stop if seg_stop < stop else stop
+                if lo < hi:
+                    spans.append((lo, hi, selector, seg_start))
+
+            if len(spans) == 1:
+                lo, hi, selector, seg_start = spans[0]
+                if torch.is_tensor(selector):
+                    sub = selector[lo - seg_start:hi - seg_start]
+                else:
+                    sub = selector
+                return fused_adaln_rms_norm(
+                    self._x[start:stop],
+                    norm_weight,
+                    self._scale,
+                    self._shift,
+                    selector=sub,
+                    eps=eps,
+                )
+            elif len(spans) > 1:
+                out = torch.empty(
+                    (stop - start, self._x.shape[1]),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                for lo, hi, selector, seg_start in spans:
+                    if torch.is_tensor(selector):
+                        sub = selector[lo - seg_start:hi - seg_start]
+                    else:
+                        sub = selector
+                    fused_adaln_rms_norm(
+                        self._x[lo:hi],
+                        norm_weight,
+                        self._scale,
+                        self._shift,
+                        selector=sub,
+                        eps=eps,
+                        out=out[lo - start:hi - start],
+                    )
+                return out
+
         rows = self._norm(self._x[start:stop])
         self._modulate(rows, start, stop)
         return rows

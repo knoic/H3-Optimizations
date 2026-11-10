@@ -135,6 +135,8 @@ class StreamedDenseSageQKVProjector:
         declines by returning None, so the request degrades to Standard
         instead of costing a reprojection for nothing.
         """
+        if self.v_mode != V_MEMORY_TWO_PASS:
+            return None
         if self._staging_parameters is None:
             return None
         scale_max, pad_to = self._staging_parameters
@@ -177,7 +179,6 @@ class StreamedDenseSageQKVProjector:
         staging = self._staging(sequence, heads, x)
         staged_v_carrier = None
         staged_v_scale = None
-        stashed_v = [] if staging is not None else None
         v = (
             None
             if staging is not None
@@ -208,24 +209,13 @@ class StreamedDenseSageQKVProjector:
                 else:
                     with diagnostics.stage("v_amax_update"):
                         staging.update(chunk_v)
-                    use_fp8 = chunk_v.is_cuda and hasattr(torch, "float8_e4m3fn")
-                    stashed_v.append(
-                        chunk_v.to(torch.float8_e4m3fn)
-                        if use_fp8
-                        else chunk_v.clone()
-                    )
                 del k, chunk_v, chunk_k, chunk_scale
             if staging is not None:
                 staging.finalize_scale()
                 for start in range(0, sequence, self.chunk_rows):
                     stop = min(start + self.chunk_rows, sequence)
-                    if stashed_v:
-                        chunk_v = stashed_v.pop(0)
-                        if chunk_v.dtype != x.dtype:
-                            chunk_v = chunk_v.to(x.dtype)
-                    else:
-                        with diagnostics.stage("v_reprojection"):
-                            chunk_v = project_v_hnd(held, x, rope_freqs, start, stop)
+                    with diagnostics.stage("v_reprojection"):
+                        chunk_v = project_v_hnd(held, x, rope_freqs, start, stop)
                     with diagnostics.stage("v_carrier_pack"):
                         staging.quantize(chunk_v, start)
                     del chunk_v
@@ -337,69 +327,137 @@ class StreamedDenseSageBackend:
             if can_in_place_residual
             else None
         )
-        try:
-            for start in range(0, projected.sequence, projected.query_chunk_rows):
-                stop = min(start + projected.query_chunk_rows, projected.sequence)
-                held = projected.held_factory(
-                    module,
-                    projected.x[start:start + 1],
-                    projected.projection_mode,
+        chunk_ranges = [
+            (start, min(start + projected.query_chunk_rows, projected.sequence))
+            for start in range(0, projected.sequence, projected.query_chunk_rows)
+        ]
+        num_chunks = len(chunk_ranges)
+        use_pipeline = (
+            num_chunks > 1
+            and getattr(projected.x, "is_cuda", False)
+            and torch.cuda.is_available()
+        )
+
+        def _project_and_quantize(start, stop):
+            held = projected.held_factory(
+                module,
+                projected.x[start:start + 1],
+                projected.projection_mode,
+            )
+            held.__enter__()
+            try:
+                q = project_q_hnd(
+                    held,
+                    projected.x,
+                    projected.rope_freqs,
+                    start,
+                    stop,
                 )
-                held.__enter__()
-                try:
-                    q = project_q_hnd(
-                        held,
-                        projected.x,
-                        projected.rope_freqs,
+            finally:
+                held.__exit__(None, None, None)
+            q_int8, q_scale = self.delegate.quantize_projected_q(q)
+            del q
+            return q_int8, q_scale
+
+        def _consume_raw(raw, start, stop):
+            rows = stop - start
+            flat = raw.transpose(1, 2).reshape(
+                rows,
+                projected.heads * projected.head_dim,
+            )
+            del raw
+            with diagnostics.stage("attention_out"):
+                if can_in_place_residual:
+                    residual_source.write_attention_residual(
+                        flat,
                         start,
                         stop,
+                        module.out_proj,
+                        residual_projection,
                     )
-                finally:
-                    held.__exit__(None, None, None)
-                q_int8, q_scale = self.delegate.quantize_projected_q(q)
-                del q
-                raw = self.delegate.execute_rectangular(
-                    q_int8,
-                    q_scale,
-                    projected.k_int8,
-                    projected.k_scale,
-                    prepared.v_carrier,
-                    prepared.v_scale,
-                    output_dtype=projected.output_dtype,
-                    softmax_scale=projected.head_dim ** -0.5,
-                    layer_index=projected.layer_index,
-                )
-                del q_int8, q_scale
-                if stop == projected.sequence:
-                    projected.k_int8 = None
-                    projected.k_scale = None
-                    prepared.v_carrier = None
-                    prepared.v_scale = None
-                rows = stop - start
-                flat = raw.transpose(1, 2).reshape(
-                    rows,
-                    projected.heads * projected.head_dim,
-                )
-                del raw
-                with diagnostics.stage("attention_out"):
-                    if can_in_place_residual:
-                        residual_source.write_attention_residual(
-                            flat,
-                            start,
-                            stop,
-                            module.out_proj,
-                            residual_projection,
+                else:
+                    projected_rows = module.out_proj(flat)
+                    if tuple(projected_rows.shape) != (rows, hidden):
+                        raise EfficientSageError(
+                            "streamed dense Sage out_proj returned %s"
+                            % (tuple(projected_rows.shape),)
                         )
-                    else:
-                        projected_rows = module.out_proj(flat)
-                        if tuple(projected_rows.shape) != (rows, hidden):
-                            raise EfficientSageError(
-                                "streamed dense Sage out_proj returned %s"
-                                % (tuple(projected_rows.shape),)
-                            )
-                        result[start:stop].copy_(projected_rows)
-                        del projected_rows
-                del flat
+                    result[start:stop].copy_(projected_rows)
+                    del projected_rows
+            del flat
+
+        try:
+            if use_pipeline:
+                stream_compute = torch.cuda.current_stream(device=projected.x.device)
+                stream_proj = torch.cuda.Stream(device=projected.x.device)
+
+                # Pre-queue chunk 0 on stream_proj
+                with torch.cuda.stream(stream_proj):
+                    c0_start, c0_stop = chunk_ranges[0]
+                    q_int8_next, q_scale_next = _project_and_quantize(c0_start, c0_stop)
+                    event_proj_ready = torch.cuda.Event()
+                    event_proj_ready.record(stream_proj)
+
+                try:
+                    for i, (start, stop) in enumerate(chunk_ranges):
+                        # Ensure chunk i Q is ready on stream_compute
+                        stream_compute.wait_event(event_proj_ready)
+                        q_int8, q_scale = q_int8_next, q_scale_next
+                        q_int8.record_stream(stream_compute)
+                        q_scale.record_stream(stream_compute)
+
+                        # Pipeline: queue chunk i+1 on stream_proj in parallel
+                        if i + 1 < num_chunks:
+                            next_start, next_stop = chunk_ranges[i + 1]
+                            with torch.cuda.stream(stream_proj):
+                                q_int8_next, q_scale_next = _project_and_quantize(next_start, next_stop)
+                                event_proj_ready = torch.cuda.Event()
+                                event_proj_ready.record(stream_proj)
+
+                        raw = self.delegate.execute_rectangular(
+                            q_int8,
+                            q_scale,
+                            projected.k_int8,
+                            projected.k_scale,
+                            prepared.v_carrier,
+                            prepared.v_scale,
+                            output_dtype=projected.output_dtype,
+                            softmax_scale=projected.head_dim ** -0.5,
+                            layer_index=projected.layer_index,
+                        )
+                        del q_int8, q_scale
+                        if stop == projected.sequence:
+                            projected.k_int8 = None
+                            projected.k_scale = None
+                            prepared.v_carrier = None
+                            prepared.v_scale = None
+
+                        _consume_raw(raw, start, stop)
+                finally:
+                    stream_compute.wait_stream(stream_proj)
+            else:
+                for start, stop in chunk_ranges:
+                    q_int8, q_scale = _project_and_quantize(start, stop)
+                    raw = self.delegate.execute_rectangular(
+                        q_int8,
+                        q_scale,
+                        projected.k_int8,
+                        projected.k_scale,
+                        prepared.v_carrier,
+                        prepared.v_scale,
+                        output_dtype=projected.output_dtype,
+                        softmax_scale=projected.head_dim ** -0.5,
+                        layer_index=projected.layer_index,
+                    )
+                    del q_int8, q_scale
+                    if stop == projected.sequence:
+                        projected.k_int8 = None
+                        projected.k_scale = None
+                        prepared.v_carrier = None
+                        prepared.v_scale = None
+
+                    _consume_raw(raw, start, stop)
+
             if can_in_place_residual:
                 return residual_source.finish_attention_residual()
             return result

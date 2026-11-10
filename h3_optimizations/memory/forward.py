@@ -22,6 +22,7 @@ from .linear import (
     module_swiglu_fc2,
     swiglu_eager,
 )
+from ..fused_adaln_norm import fused_adaln_rms_norm
 from ..normalized_rows import NORM1_SOURCE_KEY, NormalizedRows
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 from ..qkv.int8 import (
@@ -383,14 +384,28 @@ def make_forward(block, layer_index, config, original_forward=None):
             and not _short_sequence_uses_held(config)
         ):
             with diagnostics.stage('norm2_modulation'):
-                h = block.norm2(x)
-                for start, stop, selector in segments:
-                    _scale_shift(
-                        h[start:stop],
-                        shift_mlp,
-                        scale_mlp,
-                        selector,
-                    )
+                norm_weight = getattr(block.norm2, 'weight', None)
+                if norm_weight is not None:
+                    h = torch.empty_like(x)
+                    for start, stop, selector in segments:
+                        fused_adaln_rms_norm(
+                            x[start:stop],
+                            norm_weight,
+                            scale_mlp,
+                            shift_mlp,
+                            selector=selector,
+                            eps=getattr(block.norm2, 'eps', 1e-6),
+                            out=h[start:stop],
+                        )
+                else:
+                    h = block.norm2(x)
+                    for start, stop, selector in segments:
+                        _scale_shift(
+                            h[start:stop],
+                            shift_mlp,
+                            scale_mlp,
+                            selector,
+                        )
             with diagnostics.stage('mlp_fc1_fc2'):
                 out = block.mlp(h)
             with diagnostics.stage('final_mlp_gate'):
@@ -464,13 +479,24 @@ def make_forward(block, layer_index, config, original_forward=None):
                             del expanded
                             continue
                 with diagnostics.stage('norm2_modulation'):
-                    h = block.norm2(x[chunk.start:chunk.stop])
-                    _scale_shift(
-                        h,
-                        shift_mlp,
-                        scale_mlp,
-                        chunk.mod_row,
-                    )
+                    norm_weight = getattr(block.norm2, 'weight', None)
+                    if norm_weight is not None:
+                        h = fused_adaln_rms_norm(
+                            x[chunk.start:chunk.stop],
+                            norm_weight,
+                            scale_mlp,
+                            shift_mlp,
+                            selector=chunk.mod_row,
+                            eps=getattr(block.norm2, 'eps', 1e-6),
+                        )
+                    else:
+                        h = block.norm2(x[chunk.start:chunk.stop])
+                        _scale_shift(
+                            h,
+                            shift_mlp,
+                            scale_mlp,
+                            chunk.mod_row,
+                        )
 
                 if (
                     _gated_path(mlp_path, config)
