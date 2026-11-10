@@ -33,6 +33,7 @@ class SageSM80MemoryEfficientBackend(ArchitectureBackend):
     projected_q_tile = 128
     projected_k_tile = 64
     requires_h3_triton = True
+    expected_v_dtype = torch.float16
 
     def __init__(
         self,

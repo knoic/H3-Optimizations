@@ -29,6 +29,7 @@ class SageSM86MemoryEfficientBackend(ArchitectureBackend):
     projected_qkv_format = "sage_per_block_128_64"
     projected_q_tile = 128
     projected_k_tile = 64
+    expected_v_dtype = torch.float16
 
     def __init__(
         self,

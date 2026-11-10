@@ -319,6 +319,7 @@ class ArchitectureBackend:
     requires_runtime_context = False
     approximate = False
     runtime_listeners = ()
+    expected_v_dtype = None
 
     def __init__(self, allow_cpu_for_tests=False):
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)

@@ -149,6 +149,31 @@ class StreamedSparseSageTests(unittest.TestCase):
         self.assertEqual(float(projected.v[0, 0, -1, 0]), 499.0)
         self.assertEqual(projected.query_chunk_rows, 256)
 
+    def test_assemble_sparse_qkv_respects_target_v_dtype(self):
+        sequence = 128
+        x = torch.randn(sequence, 256, dtype=torch.bfloat16)
+        module = SimpleNamespace(heads=2, head_dim=128)
+        spec = sparse_spec()
+        spec.expected_v_dtype = torch.float16
+
+        def project(_module, _x, _rope, start, end):
+            rows = end - start
+            v = torch.randn(1, 2, rows, 128, dtype=torch.bfloat16)
+            return v, v, v
+
+        projected = streamed._assemble_streamed_sparse_qkv(
+            module,
+            x,
+            None,
+            layer_index=0,
+            spec=spec,
+            project_chunk_rows=128,
+            query_chunk_rows=128,
+            packer=cpu_packer,
+            project_chunk=project,
+        )
+        self.assertEqual(projected.v.dtype, torch.float16)
+
     def test_projector_defaults_to_4096_query_rows(self):
         projector = streamed.StreamedSparseSageQKVProjector(sparse_spec())
         self.assertEqual(projector.chunk_rows, 4096)

@@ -124,6 +124,18 @@ class FakeSage:
             raise AssertionError("a source weight binding escaped into Sage execution")
 
 
+class FakeAmpereSage(FakeSage):
+    name = "sage_mem_eff_sm86"
+    expected_v_dtype = torch.float16
+
+    @staticmethod
+    def prepare_streamed_v(v):
+        return (
+            v if v.dtype == torch.float16 else v.to(torch.float16),
+            None,
+        )
+
+
 class Module:
     heads = 2
     head_dim = 128
@@ -226,6 +238,65 @@ class DenseStreamedSageTests(unittest.TestCase):
         self.assertIsNot(actual, residual)
         self.assertTrue(torch.equal(actual, expected))
         self.assertTrue(torch.equal(residual, expected))
+
+    def test_ampere_backend_allocates_v_in_fp16_directly_eliminating_duplicate(self):
+        factory = FakeHeldFactory()
+        sage = FakeAmpereSage(factory)
+        projector = StreamedDenseSageQKVProjector(
+            sage,
+            chunk_rows=2,
+            projection_mode="native",
+            held_factory=factory,
+            allow_cpu_for_tests=True,
+        )
+        backend = StreamedDenseSageBackend(sage)
+        module = Module()
+        # Input tensor is BF16 (as commonly used in H3 models)
+        x = (torch.arange(5 * 256).reshape(5, 256) % 100).to(torch.bfloat16)
+
+        projected = projector.project(
+            module,
+            x,
+            None,
+            layer_index=3,
+            transformer_options={},
+        )
+
+        # 1. Verify V was allocated directly as FP16 rather than inheriting BF16 from x
+        self.assertEqual(projected.v.dtype, torch.float16)
+        original_v = projected.v
+
+        # 2. Verify prepare_projected retains the exact same tensor instance with ZERO copy/reallocation
+        prepared = backend.prepare_projected(
+            projected,
+            layer_index=3,
+            transformer_options={},
+        )
+        self.assertIs(prepared.v_carrier, original_v)
+
+    def test_default_backend_without_expected_v_dtype_preserves_x_dtype(self):
+        factory = FakeHeldFactory()
+        sage = FakeSage(factory)
+        projector = StreamedDenseSageQKVProjector(
+            sage,
+            chunk_rows=2,
+            projection_mode="native",
+            held_factory=factory,
+            allow_cpu_for_tests=True,
+        )
+        module = Module()
+        x = (torch.arange(5 * 256).reshape(5, 256) % 100).to(torch.bfloat16)
+
+        projected = projector.project(
+            module,
+            x,
+            None,
+            layer_index=3,
+            transformer_options={},
+        )
+
+        # When backend does not declare expected_v_dtype, V inherits x.dtype (BF16)
+        self.assertEqual(projected.v.dtype, torch.bfloat16)
 
 
 class StagingHeld(FakeHeld):

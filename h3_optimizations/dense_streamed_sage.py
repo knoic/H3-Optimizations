@@ -179,12 +179,19 @@ class StreamedDenseSageQKVProjector:
         staging = self._staging(sequence, heads, x)
         staged_v_carrier = None
         staged_v_scale = None
+        target_v_dtype = getattr(self.backend, "expected_v_dtype", None)
+        if target_v_dtype is None:
+            backend_name = getattr(self.backend, "name", "")
+            if any(arch in backend_name for arch in ("sm80", "sm86", "sm87")):
+                target_v_dtype = torch.float16
+            else:
+                target_v_dtype = x.dtype
         v = (
             None
             if staging is not None
             else torch.empty(
                 (1, heads, sequence, 128),
-                dtype=x.dtype,
+                dtype=target_v_dtype,
                 device=x.device,
             )
         )
