@@ -438,71 +438,6 @@ def make_forward(block, layer_index, config, original_forward=None):
                 mlp_path == 'convrot'
                 or (mlp_path == 'held' and held.supports_prequantized_fc1())
             )
-
-            def _run_mlp_chunk(x_slice, mod_row):
-                with diagnostics.stage('norm2_modulation'):
-                    norm_weight = getattr(block.norm2, 'weight', None)
-                    if norm_weight is not None:
-                        h = fused_adaln_rms_norm(
-                            x_slice,
-                            norm_weight,
-                            scale_mlp,
-                            shift_mlp,
-                            selector=mod_row,
-                            eps=getattr(block.norm2, 'eps', 1e-6),
-                        )
-                    else:
-                        h = block.norm2(x_slice)
-                        _scale_shift(
-                            h,
-                            shift_mlp,
-                            scale_mlp,
-                            mod_row,
-                        )
-
-                if (
-                    _gated_path(mlp_path, config)
-                    and not torch.is_tensor(mod_row)
-                ):
-                    _run_held_native_gated(
-                        held,
-                        h,
-                        x_slice,
-                        gate_mlp,
-                        mod_row,
-                    )
-                    del h
-                    return
-
-                out, expanded, _path = _run_mlp(
-                    block,
-                    h,
-                    held,
-                    mlp_path,
-                    config,
-                )
-                with diagnostics.stage('final_mlp_gate'):
-                    _gate_add(
-                        x_slice,
-                        out,
-                        gate_mlp,
-                        mod_row,
-                    )
-                del h, expanded, out
-
-            can_use_graph = (
-                not fused_mlp_norm
-                and x.is_cuda
-                and torch.cuda.is_available()
-                and hasattr(torch.cuda, 'CUDAGraph')
-                and not torch.cuda.is_current_stream_capturing()
-                and not torch.compiler.is_compiling()
-            )
-            cuda_graph = None
-            static_x = None
-            warmup_count = 0
-            graph_capture_failed = False
-
             for chunk in chunks:
                 if fused_mlp_norm:
                     with diagnostics.stage('norm2_modulation_quantize'):
@@ -543,55 +478,57 @@ def make_forward(block, layer_index, config, original_forward=None):
                             )
                             del expanded
                             continue
+                with diagnostics.stage('norm2_modulation'):
+                    norm_weight = getattr(block.norm2, 'weight', None)
+                    if norm_weight is not None:
+                        h = fused_adaln_rms_norm(
+                            x[chunk.start:chunk.stop],
+                            norm_weight,
+                            scale_mlp,
+                            shift_mlp,
+                            selector=chunk.mod_row,
+                            eps=getattr(block.norm2, 'eps', 1e-6),
+                        )
+                    else:
+                        h = block.norm2(x[chunk.start:chunk.stop])
+                        _scale_shift(
+                            h,
+                            shift_mlp,
+                            scale_mlp,
+                            chunk.mod_row,
+                        )
 
-                is_static_chunk = (
-                    can_use_graph
-                    and chunk.rows == config.chunk_rows
+                if (
+                    _gated_path(mlp_path, config)
                     and not torch.is_tensor(chunk.mod_row)
-                )
-
-                if is_static_chunk and cuda_graph is not None:
-                    with diagnostics.stage('mlp_cuda_graph_replay'):
-                        static_x.copy_(x[chunk.start:chunk.stop])
-                        cuda_graph.replay()
-                        x[chunk.start:chunk.stop].copy_(static_x)
+                ):
+                    # The fused kernel takes one gate per output channel, so
+                    # only scalar modulation segments qualify.
+                    _run_held_native_gated(
+                        held,
+                        h,
+                        x[chunk.start:chunk.stop],
+                        gate_mlp,
+                        chunk.mod_row,
+                    )
+                    del h
                     continue
 
-                if is_static_chunk and not graph_capture_failed:
-                    if warmup_count < 2:
-                        _run_mlp_chunk(x[chunk.start:chunk.stop], chunk.mod_row)
-                        warmup_count += 1
-                        continue
-
-                    try:
-                        static_x = torch.empty(
-                            (config.chunk_rows, x.shape[1]),
-                            dtype=x.dtype,
-                            device=x.device,
-                        )
-                        cuda_graph = torch.cuda.CUDAGraph()
-                        capture_stream = torch.cuda.Stream(device=x.device)
-                        capture_stream.wait_stream(torch.cuda.current_stream(device=x.device))
-                        with torch.cuda.stream(capture_stream):
-                            static_x.copy_(x[chunk.start:chunk.stop])
-                            _run_mlp_chunk(static_x, chunk.mod_row)
-                            cuda_graph.capture_begin()
-                            _run_mlp_chunk(static_x, chunk.mod_row)
-                            cuda_graph.capture_end()
-                        torch.cuda.current_stream(device=x.device).wait_stream(capture_stream)
-                        x[chunk.start:chunk.stop].copy_(static_x)
-                        continue
-                    except Exception as exc:
-                        logging.debug(
-                            '%s CUDA graph capture skipped for chunk MLP: %s',
-                            LOG_PREFIX,
-                            exc,
-                        )
-                        graph_capture_failed = True
-                        cuda_graph = None
-                        static_x = None
-
-                _run_mlp_chunk(x[chunk.start:chunk.stop], chunk.mod_row)
+                out, expanded, _path = _run_mlp(
+                    block,
+                    h,
+                    held,
+                    mlp_path,
+                    config,
+                )
+                with diagnostics.stage('final_mlp_gate'):
+                    _gate_add(
+                        x[chunk.start:chunk.stop],
+                        out,
+                        gate_mlp,
+                        chunk.mod_row,
+                    )
+                del h, expanded, out
         finally:
             if held is not None:
                 held.__exit__(None, None, None)
