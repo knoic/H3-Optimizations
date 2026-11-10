@@ -62,6 +62,7 @@ from h3_optimizations.plan import (  # noqa: E402
     KITCHEN_V_MEMORY_TWO_PASS,
 )
 from h3_optimizations.public_nodes import H3OptimizationsExtension  # noqa: E402
+from h3_optimizations.composable_memory_node import H3ComposableMemoryOptimization
 from h3_optimizations.vsa.node import H3VSAAttention  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -74,6 +75,7 @@ class PublicNodeTests(unittest.TestCase):
             nodes,
             [
                 H3MemoryOptimization,
+                H3ComposableMemoryOptimization,
                 H3AIMDOResidencyLimiter,
                 H3SparseAttention,
                 H3SparseAttentionAdvanced,

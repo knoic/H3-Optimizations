@@ -62,6 +62,39 @@ the H3 plan is disabled instead of silently overwriting the other patch.
 
 ## H3 Memory Optimization
 
+### Independent optimization layers (local revision)
+
+The new **H3 Optimization Layers** node provides independent **Standard
+optimizations** and **Low VRAM layer** switches. Replace the old Memory node
+with this node when using the new controls; existing workflows keep their old
+node and serialized settings.
+
+| Standard | Low VRAM | Execution |
+| --- | --- | --- |
+| Off | Off | Return the input model unchanged |
+| On | Off | Standard MLP/FinalLayer/embedding optimizations and compatible streamed QKV |
+| Off | On | Minimal compatible QKV machinery plus two-pass V; no standard MLP/FinalLayer/embedding patches |
+| On | On | Standard optimizations plus two-pass V, sharing one QKV execution plan |
+
+Kitchen Standard retains original-dtype V and calls the normal full-V quantizer
+once. Low VRAM instead collects global scales and projects V again in bounded
+chunks; it reduces V retention at the cost of extra work. Neither mode uses an
+FP8 temporary stash before the existing INT8 V quantizer. The previous stash
+changed values, so corrected results need not reproduce it. No speed or total
+peak-VRAM improvement is guaranteed for a particular workflow.
+
+External full-Q attention overrides, including SLA implementations that do not
+advertise the streamed-H3 QKV consumer contract, remain authoritative. The status
+reports the V-memory mode as **not applied** on those paths; enabling both layers
+does not bypass this compatibility requirement. Supported Sage backends may also
+decline two-pass V when their carrier cannot save memory. Standard can still
+apply its other compatible components.
+
+Defaults are Standard on and Low VRAM off, with native precision preserved. Use
+one Layers node per model branch. The shared plan also composes with the pack's
+Sparse node without installing duplicate QKV wrappers. GPU performance and
+whole-model bitwise equivalence must still be checked on the target workflow.
+
 H3 creates several large temporary tensors while generating video. This node
 processes compatible work in smaller pieces and releases temporary data earlier,
 which can substantially reduce peak VRAM use.

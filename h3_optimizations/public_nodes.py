@@ -14,6 +14,7 @@ from . import amd_policy as _amd_policy  # noqa: F401
 from . import universal_sparse_fallback as _universal_sparse_fallback  # noqa: F401
 from .aimdo_limiter import H3AIMDOResidencyLimiter
 from .memory_migration_node import H3MemoryOptimization
+from .composable_memory_node import H3ComposableMemoryOptimization
 from .nodes import (
     H3SparseAttention,
     H3SparseAttentionAdvanced,
@@ -27,6 +28,7 @@ class H3OptimizationsExtension(ComfyExtension):
     async def get_node_list(self):
         return [
             H3MemoryOptimization,
+            H3ComposableMemoryOptimization,
             H3AIMDOResidencyLimiter,
             H3SparseAttention,
             H3SparseAttentionAdvanced,

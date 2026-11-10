@@ -195,8 +195,11 @@ class MemoryRequest:
     mlp_strict: bool = False
     embedding_memory: str = EMBEDDING_MEMORY_AUTO
     attention_v_memory: str = V_MEMORY_RETAIN
+    standard_optimizations: bool = True
 
     def __post_init__(self):
+        if not isinstance(self.standard_optimizations, bool):
+            raise ValueError('standard_optimizations must be a boolean')
         if self.attention not in ATTENTION_REQUESTS:
             raise ValueError('unknown dense attention request %r' % self.attention)
         if self.qkv_streaming not in QKV_STREAMING_REQUESTS:
@@ -250,6 +253,7 @@ class MemoryRequest:
             bool(self.mlp_strict),
             self.embedding_memory,
             self.attention_v_memory,
+            self.standard_optimizations,
         )
 
 

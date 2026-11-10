@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import sys
 import unittest
+import weakref
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -96,6 +98,52 @@ class _Module:
 
 
 class StreamedKitchenOutputTests(unittest.TestCase):
+    def test_dense_query_temporaries_die_before_output_projection(self):
+        source = (torch.arange(257 * 256).reshape(257, 256) % 100).float()
+        expected = source.clone()
+        query_refs, packed_refs = [], []
+
+        def project(_held, x, _rope, start, stop):
+            q = x[start:stop].reshape(1, stop - start, 2, 128).transpose(1, 2).clone()
+            query_refs.append(weakref.ref(q))
+            return q
+
+        def quantize(_kitchen, _carrier, q):
+            packed = q.to(torch.int8)
+            packed_refs.append(weakref.ref(packed))
+            return SimpleNamespace(q=packed, q_scale=torch.ones(1))
+
+        def attention(carrier, **_kwargs):
+            self.assertIsNone(query_refs[-1](), 'original Q survived quantization')
+            return carrier.q.float()
+
+        def out_proj(rows):
+            self.assertIsNone(packed_refs[-1](), 'packed Q survived attention')
+            if len(query_refs) == 3:
+                self.assertTrue(all(ref() is None for ref in kv_refs),
+                                'global K/V survived the last attention call')
+            else:
+                self.assertTrue(all(ref() is not None for ref in kv_refs))
+            return rows
+
+        module = SimpleNamespace(heads=2, head_dim=128, out_proj=out_proj)
+        kitchen = SimpleNamespace(int8_attention_from_prequantized=attention)
+        prepared = PreparedStreamedKitchenQKV(
+            module, source, None,
+            SimpleNamespace(k=torch.zeros(1), v=torch.zeros(1)), 'native', source,
+        )
+        kv_refs = [weakref.ref(prepared.carrier.k), weakref.ref(prepared.carrier.v)]
+        backend = ChunkedKitchenAttentionBackend(stream_output=True, query_chunk_rows=128)
+        with (
+            mock.patch('h3_optimizations.kitchen_qkv.resolve_kitchen', return_value=kitchen),
+            mock.patch('h3_optimizations.kitchen_qkv.create_held_qkv', return_value=mock.MagicMock()),
+            mock.patch('h3_optimizations.kitchen_qkv.project_q_hnd', new=project),
+            mock.patch('h3_optimizations.kitchen_qkv._quantize_q_chunk', new=quantize),
+        ):
+            actual = backend.execute_projected(module, prepared)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(len(query_refs), 3)
+
     def _backend(self, kitchen, query_chunk_rows=128):
         projector = ChunkedKitchenQKVProjector(stream_output=True)
         return SparseKitchenBackend(

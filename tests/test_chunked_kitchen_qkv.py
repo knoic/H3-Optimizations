@@ -448,7 +448,7 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
         class Staging:
             instance = None
 
-            def __init__(self, _spec):
+            def __init__(self, _spec, *, backend):
                 Staging.instance = self
                 self.updates = []
                 self.quantized = []

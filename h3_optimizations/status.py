@@ -250,9 +250,19 @@ def _v_memory_notice(qkv):
     Other attention paths retain V, so staying silent would leave the readout
     implying a saving that never happened.
     '''
-    if qkv.get('v_memory_requested') != 'two_pass':
+    if qkv.get('v_memory_requested') is None:
         return None
+    if qkv.get('projector') is None and qkv.get('provider') == 'standard_h3_qkv':
+        reason = str(qkv.get('reason') or 'no compatible H3 QKV projector').strip()
+        return (
+            'Attention memory mode: not applied; preserved current attention. '
+            'Reason: %s' % reason
+        )
     if qkv.get('v_memory') == 'two_pass':
+        return 'Attention memory mode: Lower VRAM (two-pass V; extra V projection).'
+    if qkv.get('v_memory_requested') != 'two_pass':
+        if qkv.get('v_memory') == 'retain':
+            return 'Attention memory mode: Standard (V retained; no V reprojection).'
         return None
     return (
         'Attention memory mode: Lower VRAM requested but not available on '
@@ -303,6 +313,12 @@ def format_memory_status(model):
         'QKV: %s' % format_qkv_execution(status),
         'MLP: %s' % _provider_text(mlp, 'off'),
     ]
+    layers = status.get('layers')
+    if layers is not None:
+        lines.append('Optimization layers: Standard %s; Low VRAM %s.' % (
+            'on' if layers.get('standard') else 'off',
+            'on' if layers.get('low_vram') else 'off',
+        ))
     canonical = status.get('canonical_quantization') or {}
     if canonical.get('converted_count'):
         lines.insert(

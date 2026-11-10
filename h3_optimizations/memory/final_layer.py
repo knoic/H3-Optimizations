@@ -403,3 +403,23 @@ def clear_cube_state(model_patcher, cube_state):
             ),
         )
     return True
+
+
+def clear_chunking(model_patcher):
+    '''Remove owned chunking while retaining any independently owned cube order.'''
+    existing = getattr(model_patcher, 'object_patches', {}).get(FINAL_LAYER_KEY)
+    if existing is None or getattr(existing, OWNER_MARKER, False) is not True:
+        return False
+    model = get_minimax_h3_model(model_patcher)
+    layer = getattr(model, 'final_layer', None)
+    original = getattr(existing, ORIGINAL_MARKER, None)
+    if layer is None or original is None:
+        raise H3FinalLayerPatchError('cannot recover the owned FinalLayer forward')
+    cube_state = getattr(existing, CUBE_STATE_MARKER, None)
+    if cube_state is None:
+        _restore_original(model_patcher, layer, original)
+    else:
+        model_patcher.object_patches[FINAL_LAYER_KEY] = make_forward(
+            layer, original_forward=original, cube_state=cube_state,
+        )
+    return True

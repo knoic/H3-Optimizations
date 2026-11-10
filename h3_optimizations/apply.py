@@ -76,11 +76,13 @@ from .memory.fused_residual import (
     unavailable_reason as fused_residual_unavailable_reason,
 )
 from .memory.final_layer import install as install_final_layer
+from .memory.final_layer import clear_chunking as clear_final_layer_chunking
 from .memory.embedding import clear as clear_embedding_memory
 from .memory.embedding import install as install_embedding_memory
 from .memory.embedding import is_installed as is_embedding_memory_installed
 from .memory.embedding import released_by_comfy as embedding_released_by_comfy
 from .memory.patch import install as install_memory_patch
+from .memory.patch import clear as clear_memory_patch
 from .model import get_h3_blocks, is_minimax_h3
 from .patch import clear_backend, configure_backend
 from .plan import (
@@ -1162,6 +1164,11 @@ def _install_mlp(
     force_rebuild=False,
 ):
     memory = plan.memory
+    if memory is not None and not memory.standard_optimizations:
+        clear_memory_patch(model_patcher)
+        clear_embedding_memory(model_patcher)
+        clear_final_layer_chunking(model_patcher)
+        return resolve_mlp_provider(inventory, request='off'), 0
     if memory is None:
         clear_embedding_memory(model_patcher)
         return resolve_mlp_provider(inventory, request='off'), 0
@@ -1261,6 +1268,10 @@ def _status(
     return {
         'plan_version': int(plan.version),
         'plan_signature': plan.signature,
+        'layers': {
+            'standard': plan.memory is not None and plan.memory.standard_optimizations,
+            'low_vram': plan.memory is not None and plan.memory.attention_v_memory == 'two_pass',
+        },
         'attention': {
             'requested': attention.requested,
             'selected': attention.selected,
@@ -1348,7 +1359,7 @@ def _status(
             None
             if plan.memory is None
             else {
-                'chunked': True,
+                'chunked': plan.memory.standard_optimizations,
                 'chunk_rows': int(plan.memory.chunk_rows),
             }
         ),
@@ -1731,10 +1742,15 @@ def _reconcile_plan(
             if request is not None
         ) or 'no H3 optimizations'
         logging.info(
-            '%s final plan: %s; attention: %s.',
+            '%s final plan: %s; attention: %s; QKV=%s; '
+            'V memory requested=%s effective=%s; MLP=%s.',
             LOG_PREFIX,
             feature_summary,
             _attention_summary_name(attention),
+            qkv.provider_id,
+            None if plan.memory is None else plan.memory.attention_v_memory,
+            getattr(attention.projector, 'v_mode', 'not applied'),
+            mlp.provider_id,
         )
         _warn_about_slow_paths(attention, qkv)
     return patched

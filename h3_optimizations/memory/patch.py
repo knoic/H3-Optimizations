@@ -18,6 +18,30 @@ class H3MemoryPatchError(RuntimeError):
     pass
 
 
+def clear(model_patcher):
+    '''Remove only H3-owned block wrappers, preserving foreign forwards.'''
+    patches = model_patcher.object_patches
+    for index, block in enumerate(get_h3_blocks(model_patcher)):
+        key = key_for(index)
+        current = patches.get(key)
+        if current is None or getattr(current, OWNER_MARKER, False) is not True:
+            continue
+        original = getattr(current, ORIGINAL_MARKER, None)
+        if original is None:
+            raise H3MemoryPatchError('installed H3 memory patch has no recoverable original')
+        stock = unpatched_model_object(model_patcher, key, block.forward)
+        if original is stock or (
+            getattr(original, '__self__', None) is block
+            and getattr(original, '__func__', None) is getattr(stock, '__func__', None)
+        ):
+            patches.pop(key, None)
+        else:
+            patches[key] = original
+    options = dict(model_patcher.model_options.get('transformer_options', {}))
+    options['h3_optimizations_preserved_block_patches'] = []
+    model_patcher.model_options['transformer_options'] = options
+
+
 def key_for(index):
     return '%s.%d.forward' % (BLOCKS_ATTR, int(index))
 
