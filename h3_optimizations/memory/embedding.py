@@ -12,6 +12,7 @@ import comfy.model_prefetch
 from comfy.ldm.minimax import model as minimax
 
 from ..model import get_minimax_h3_model, unpatched_model_object
+from ..precomputed_silu import precompute_silu
 
 
 FORWARD_KEY = 'diffusion_model._forward'
@@ -219,6 +220,14 @@ def make_forward(model, original_forward, generation):
             t_emb = torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))
         else:
             t_emb = model.time_embedder(t_vals).to(dtype)
+        # Pre-compute F.silu(t_emb) once and cache it on the tensor wrapper.
+        # Every block's adaln_proj calls nn.functional.silu(t_emb); since t_emb
+        # is constant across all 50 blocks, the same SiLU output would otherwise
+        # be recomputed 50+ times per denoising step.  The wrapper intercepts
+        # F.silu via __torch_function__ and returns the cached result at zero
+        # kernel cost, shaving ~1 000 redundant GPU dispatches over 20 steps.
+        # Zero VRAM increase: the cached tensor is [M, t_dim] (~3 KB).
+        t_emb = precompute_silu(t_emb)
 
         rope_freqs = minimax.rope_rotation_table(model.rope_freqs(layout.position_ids, device), dtype)
 
